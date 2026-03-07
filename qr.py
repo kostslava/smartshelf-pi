@@ -17,8 +17,10 @@ Flow:
   1. Scan QR code -> look up user in Firestore
   2. Check cooldowns (4h for recipients) and bans (1-week for violations)
   3. Write activeSession to cabinet/cabinet_001
-  4. For recipients: the Vision Node auto-captures after 5s countdown
+  4. For recipients: 10-second OLED countdown; motion detection skips the
+     countdown and waits for stillness to capture a clear photo
   5. On second scan by same user OR timeout -> close session
+  6. First violation = warning only; second violation = 1-week ban
 """
 
 from picamera2 import Picamera2
@@ -75,8 +77,10 @@ SERVICE_ACCOUNT_KEY_PATH = os.path.expanduser('~/firestone/auth.json')
 CABINET_ID = os.getenv("CABINET_ID", "cabinet_001")
 SESSION_TIMEOUT = 120          # seconds before auto-close
 RECIPIENT_COOLDOWN_HOURS = 4   # recipients can visit every 4 hours
-BAN_DURATION_DAYS = 7          # 1-week ban for violations
+BAN_DURATION_DAYS = 7          # 1-week ban for violations (2nd+ offense)
 COOLDOWN = 2                   # QR scan debounce seconds
+RECIPIENT_COUNTDOWN = 10       # OLED countdown seconds before auto-capture
+RESULT_POLL_TIMEOUT = 30       # seconds to wait for Gemini analysis result
 
 # ---------- Firebase ----------
 cred = credentials.Certificate(SERVICE_ACCOUNT_KEY_PATH)
@@ -84,13 +88,27 @@ firebase_admin.initialize_app(cred)
 db = firestore.client()
 
 # ---------- Camera ----------
-picam2 = Picamera2()
-config = picam2.create_preview_configuration(
-    main={"size": (480, 360)},
-    buffer_count=1
-)
-picam2.configure(config)
-picam2.start()
+def _init_camera(retries=10, delay=3):
+    """Try to acquire the camera, retrying if another process holds it."""
+    for attempt in range(1, retries + 1):
+        try:
+            cam = Picamera2()
+            cfg = cam.create_preview_configuration(
+                main={"size": (480, 360)},
+                buffer_count=1
+            )
+            cam.configure(cfg)
+            cam.start()
+            return cam
+        except RuntimeError as exc:
+            print(f"[Camera] Attempt {attempt}/{retries} failed: {exc}", flush=True)
+            if attempt < retries:
+                print(f"[Camera] Retrying in {delay}s...", flush=True)
+                time.sleep(delay)
+    raise RuntimeError("Could not acquire camera after multiple attempts. "
+                       "Kill any other process using it and try again.")
+
+picam2 = _init_camera()
 
 # ---------- QR Detector ----------
 detector = cv2.QRCodeDetector()
@@ -149,27 +167,35 @@ def _render_frame():
         score = state["score"]
         countdown = state["countdown"]
 
-        # Name bar
-        draw.rectangle((0, 0, 127, 15), fill=1)
-        draw.text((4, 1), name, font=_font_md, fill=0)
-
-        # Role badge
-        role_label = "DONOR" if role == "donor" else "RECIPIENT"
-        draw.text((4, 19), role_label, font=_font_sm, fill=1)
-        draw.text((70, 19), f"Pts:{score}", font=_font_sm, fill=1)
+        # Header bar — always shows name
+        draw.rectangle((0, 0, 127, 14), fill=1)
+        draw.text((4, 2), name, font=_font_sm, fill=0)
 
         if role == "recipient" and countdown > 0:
-            # Big countdown (kept for any external countdown use)
-            draw.text((4, 31), "Hold item to camera!", font=_font_sm, fill=1)
+            # Big clear countdown layout
+            draw.text((4, 18), "Grab an item &", font=_font_sm, fill=1)
+            draw.text((4, 29), "hold to camera", font=_font_sm, fill=1)
+            # Countdown box — centered horizontally
             cstr = str(countdown)
-            draw.text((54, 40), cstr, font=_font_lg, fill=1)
-            draw.rectangle((48, 37, 80, 63), outline=1)
-        elif role == "recipient":
-            draw.text((4, 31), "Touch sensor to", font=_font_sm, fill=1)
-            draw.text((4, 43), "take item!", font=_font_md, fill=1)
+            # box: x 44-83, y 40-62
+            draw.rectangle((44, 40, 83, 62), outline=1)
+            # Center the digit(s) inside the box
+            cx = 52 if len(cstr) == 1 else 47
+            draw.text((cx, 42), cstr, font=_font_lg, fill=1)
+            # Small label above box
+            draw.text((92, 47), "sec", font=_font_sm, fill=1)
+
+        elif role == "recipient" and countdown == 0:
+            draw.text((14, 22), "Analyzing item...", font=_font_sm, fill=1)
+            draw.text((30, 38), "Please wait", font=_font_sm, fill=1)
+            # Animated dots — use seconds modulo to cycle . / .. / ...
+            dots = "." * ((int(time.time()) % 3) + 1)
+            draw.text((98, 38), dots, font=_font_sm, fill=1)
+
         else:  # donor
-            draw.text((4, 33), "Use app to add items", font=_font_sm, fill=1)
-            draw.text((4, 46), "Scan again to sign out", font=_font_sm, fill=1)
+            draw.text((4, 19), f"Pts: {score}", font=_font_sm, fill=1)
+            draw.text((4, 32), "Add via app", font=_font_sm, fill=1)
+            draw.text((4, 46), "Scan again to exit", font=_font_sm, fill=1)
 
     elif screen == "denied":
         draw.rectangle((0, 0, 127, 15), fill=1)
@@ -312,20 +338,36 @@ def check_cooldown_and_ban(uid, role):
 
 
 def apply_ban(uid, reason="photo_violation"):
-    """Ban a user for BAN_DURATION_DAYS."""
+    """First offense: issue a warning. Second+ offense: ban for BAN_DURATION_DAYS."""
     now = datetime.now(timezone.utc)
-    ban_until = now + timedelta(days=BAN_DURATION_DAYS)
     try:
         cd_ref = db.collection("userCooldowns").document(uid)
-        cd_ref.set({
-            "bannedUntil": ban_until,
-            "violationCount": firestore.Increment(1),
-            "lastViolation": firestore.SERVER_TIMESTAMP,
-            "lastViolationReason": reason,
-        }, merge=True)
-        log(f"  BAN APPLIED: {uid} banned until {ban_until.isoformat()}")
+        cd_snap = cd_ref.get()
+        prior_violations = 0
+        if cd_snap.exists:
+            prior_violations = cd_snap.to_dict().get("violationCount", 0)
+
+        if prior_violations == 0:
+            # First offense — warning only, no ban
+            cd_ref.set({
+                "violationCount": 1,
+                "lastViolation": firestore.SERVER_TIMESTAMP,
+                "lastViolationReason": reason,
+                "warned": True,
+            }, merge=True)
+            log(f"  WARNING ISSUED (1st offense): {uid} — {reason}")
+        else:
+            # Second+ offense — apply ban
+            ban_until = now + timedelta(days=BAN_DURATION_DAYS)
+            cd_ref.set({
+                "bannedUntil": ban_until,
+                "violationCount": firestore.Increment(1),
+                "lastViolation": firestore.SERVER_TIMESTAMP,
+                "lastViolationReason": reason,
+            }, merge=True)
+            log(f"  BAN APPLIED ({prior_violations+1} offenses): {uid} banned until {ban_until.isoformat()}")
     except Exception as exc:
-        log(f"  WARNING: Could not apply ban: {exc}")
+        log(f"  WARNING: Could not apply violation: {exc}")
 
 
 def update_last_visit(uid):
@@ -406,7 +448,13 @@ def open_session(uid, role, display_name, score):
 
     log(f"  SESSION OPENED: {display_name} ({role})")
     if role == "recipient":
-        log(f"  >> RECEIVING MODE: Touch sensor D3 to capture item")
+        log(f"  >> RECEIVING MODE: 10s countdown + motion capture")
+        cap_thread = threading.Thread(
+            target=recipient_capture_loop,
+            args=(uid,),
+            daemon=True,
+        )
+        cap_thread.start()
 
     return True
 
@@ -416,7 +464,7 @@ def close_session(reason="manual"):
     Thread-safe: uses _session_lock so the timeout timer thread
     and the main thread cannot run this simultaneously.
     """
-    global active_session, session_timer
+    global active_session, session_timer, session_score_deltas
 
     with _session_lock:
         if not active_session:
@@ -498,6 +546,115 @@ def close_session(reason="manual"):
             if active_session is None:   # don't overwrite a new session's screen
                 _set_display(screen="idle", countdown=0)
     threading.Thread(target=_back_to_idle, daemon=True).start()
+
+
+# ==================================================================
+# RECIPIENT MOTION-DETECTION CAPTURE
+# ==================================================================
+
+def _do_capture(uid, frame):
+    """Save captured frame locally, write a scanRequest, and return the doc ref."""
+    try:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_dir = os.path.expanduser("~/captures")
+        os.makedirs(save_dir, exist_ok=True)
+        img_path = os.path.join(save_dir, f"{uid}_{ts}.jpg")
+        cv2.imwrite(img_path, frame)
+        _ts, doc_ref = db.collection("scanRequests").add({
+            "userId": uid,
+            "cabinetId": CABINET_ID,
+            "action": "remove",
+            "status": "pending",
+            "timestamp": firestore.SERVER_TIMESTAMP,
+            "imagePath": img_path,
+        })
+        log(f"  CAPTURED: {img_path}")
+        return doc_ref
+    except Exception as exc:
+        log(f"  WARNING: Capture failed: {exc}")
+        return None
+
+
+def _poll_result_and_punish(uid, doc_ref):
+    """Poll the scanRequest doc until Gemini finishes and log the outcome.
+
+    Violation is ONLY applied when the AI result explicitly reports that
+    there is no food item in the frame at all (confidence == 0 or
+    productName is empty/none).  An inventory mismatch is NOT a violation —
+    the user took something; the record just didn't match.
+    """
+    deadline = time.time() + RESULT_POLL_TIMEOUT
+    while time.time() < deadline:
+        time.sleep(2)
+        try:
+            snap = doc_ref.get()
+            if not snap.exists:
+                break
+            data = snap.to_dict()
+            status = data.get("status", "")
+            if status not in ("pending", "processing", ""):
+                result     = data.get("result") or {}
+                product    = (result.get("productName") or "").strip().lower()
+                confidence = float(result.get("confidence") or 1.0)
+                truly_empty = (
+                    product in ("", "none", "unknown", "nothing", "no item", "empty")
+                    and confidence < 0.20
+                )
+                if truly_empty:
+                    log(f"  AI found nothing in frame (conf={confidence:.0%}) — applying violation to {uid}")
+                    apply_ban(uid, reason="empty_frame")
+                else:
+                    log(f"  Scan complete for {uid}: '{product}' (conf={confidence:.0%}) — no violation")
+                return
+        except Exception as exc:
+            log(f"  WARNING: Result poll failed: {exc}")
+    log(f"  Result poll timed out for {uid} — no action taken")
+
+
+def recipient_capture_loop(uid):
+    """Simple 10-second countdown for a recipient session.
+
+    Shows a ticking countdown on the OLED so the user has time
+    to grab an item and hold it in front of the camera.
+    At zero the current frame is captured and submitted for
+    Gemini analysis.  A violation is only applied if the AI
+    determines there is nothing in the photo.
+    """
+    deadline = time.time() + RECIPIENT_COUNTDOWN
+    last_frame = None
+
+    _set_display(countdown=RECIPIENT_COUNTDOWN)
+
+    while True:
+        # Abort if session ended or changed user
+        with _session_lock:
+            sess = active_session
+        if sess is None or sess.get("uid") != uid:
+            return
+
+        last_frame = picam2.capture_array()
+
+        now = time.time()
+        remaining = max(0, int(deadline - now))
+        _set_display(countdown=remaining)
+
+        if now >= deadline:
+            break
+
+        time.sleep(0.1)  # ~10 fps is plenty for a countdown
+
+    log("  Countdown elapsed — capturing frame")
+    _set_display(countdown=0)  # flip OLED to "Analyzing..."
+
+    doc_ref = _do_capture(uid, last_frame)
+    if doc_ref:
+        threading.Thread(
+            target=_poll_result_and_punish,
+            args=(uid, doc_ref),
+            daemon=True,
+        ).start()
+
+    _set_display(screen="session", countdown=0)
 
 
 # ==================================================================
