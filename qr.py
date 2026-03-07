@@ -99,6 +99,7 @@ detector = cv2.QRCodeDetector()
 active_session = None          # dict with uid, role, displayName, etc.
 session_timer = None           # threading.Timer for auto-close
 session_score_deltas = []      # accumulated score changes
+_session_lock = threading.RLock()  # prevents timer thread / main thread races
 
 
 def log(msg=""):
@@ -342,7 +343,9 @@ def update_last_visit(uid):
 # ==================================================================
 
 def open_session(uid, role, display_name, score):
-    """Write activeSession to the cabinet document and start timeout."""
+    """Write activeSession to the cabinet document and start timeout.
+    Thread-safe: acquires _session_lock so it can't race with close_session.
+    """
     global active_session, session_timer, session_score_deltas
 
     session_data = {
@@ -378,23 +381,24 @@ def open_session(uid, role, display_name, score):
         log(f"  WARNING: Could not write session: {exc}")
         return False
 
-    active_session = {
-        "uid": uid,
-        "role": role,
-        "displayName": display_name,
-        "score": score,
-        "startedAt": time.time(),
-    }
-    session_score_deltas = []
+    with _session_lock:
+        active_session = {
+            "uid": uid,
+            "role": role,
+            "displayName": display_name,
+            "score": score,
+            "startedAt": time.time(),
+        }
+        session_score_deltas = []
 
-    # Start idle timeout
-    if session_timer:
-        session_timer.cancel()
-    session_timer = threading.Timer(
-        SESSION_TIMEOUT, lambda: close_session("timeout")
-    )
-    session_timer.daemon = True
-    session_timer.start()
+        # Cancel any stale timer, start fresh one
+        if session_timer:
+            session_timer.cancel()
+        session_timer = threading.Timer(
+            SESSION_TIMEOUT, lambda: close_session("timeout")
+        )
+        session_timer.daemon = True
+        session_timer.start()
 
     # Update OLED
     _set_display(screen="session", name=display_name, role=role,
@@ -408,72 +412,91 @@ def open_session(uid, role, display_name, score):
 
 
 def close_session(reason="manual"):
-    """Close the active session, commit score, clear cabinet."""
+    """Close the active session, commit score, clear cabinet.
+    Thread-safe: uses _session_lock so the timeout timer thread
+    and the main thread cannot run this simultaneously.
+    """
     global active_session, session_timer
 
-    if not active_session:
-        return
+    with _session_lock:
+        if not active_session:
+            return
 
-    uid = active_session["uid"]
-    display_name = active_session["displayName"]
-    role = active_session["role"]
+        uid          = active_session["uid"]
+        display_name = active_session["displayName"]
+        role         = active_session["role"]
+        goodbye_score = active_session.get("score", 0) + sum(session_score_deltas)
 
-    # Cancel timeout timer
-    if session_timer:
-        session_timer.cancel()
-        session_timer = None
+        # Clear local state first so any re-entrant call bails immediately
+        active_session      = None
+        total_delta         = sum(session_score_deltas)
+        session_score_deltas.clear()
 
-    # Commit total score delta
-    total_delta = sum(session_score_deltas)
-    if total_delta != 0:
+        # Cancel timeout timer (no-op if already fired)
+        if session_timer:
+            session_timer.cancel()
+            session_timer = None
+
+    # Firestore work outside the lock (blocking I/O, but state already cleared)
+    try:
+        # Commit total score delta
+        if total_delta != 0:
+            try:
+                user_ref  = db.collection("users").document(uid)
+                user_snap = user_ref.get()
+                if user_snap.exists:
+                    current_score = user_snap.to_dict().get("score", 0)
+                    new_score = max(0, current_score + total_delta)
+                    user_ref.update({"score": new_score})
+                    log(f"  Score: {current_score} -> {new_score} (delta: {total_delta:+d})")
+            except Exception as exc:
+                log(f"  WARNING: Score update failed: {exc}")
+
+        # Write session_end event
         try:
-            user_ref = db.collection("users").document(uid)
-            user_snap = user_ref.get()
-            if user_snap.exists:
-                current_score = user_snap.to_dict().get("score", 0)
-                new_score = max(0, current_score + total_delta)
-                user_ref.update({"score": new_score})
-                log(f"  Score: {current_score} -> {new_score} (delta: {total_delta:+d})")
+            db.collection("events").add({
+                "type": "session_end",
+                "userId": uid,
+                "userRole": role,
+                "timestamp": firestore.SERVER_TIMESTAMP,
+                "deviceId": CABINET_ID,
+                "scoreDelta": total_delta,
+                "closeReason": reason,
+            })
         except Exception as exc:
-            log(f"  WARNING: Score update failed: {exc}")
+            log(f"  WARNING: Could not write session_end event: {exc}")
 
-    # Write session_end event
-    try:
-        db.collection("events").add({
-            "type": "session_end",
-            "userId": uid,
-            "userRole": role,
-            "timestamp": firestore.SERVER_TIMESTAMP,
-            "deviceId": CABINET_ID,
-            "scoreDelta": total_delta,
-            "closeReason": reason,
-        })
+        # Only delete activeSession from Firestore if no new session was opened
+        # in the brief window between clearing active_session and this write.
+        # If a new session WAS opened, its doc already overwrote ours — skip delete.
+        with _session_lock:
+            should_delete = (active_session is None)
+        if should_delete:
+            try:
+                db.collection("cabinet").document(CABINET_ID).update({
+                    "activeSession": firestore.DELETE_FIELD,
+                })
+            except Exception as exc:
+                log(f"  WARNING: Could not clear activeSession: {exc}")
+
+        # Update cooldown for recipients
+        if role == "recipient":
+            update_last_visit(uid)
+
     except Exception as exc:
-        log(f"  WARNING: Could not write session_end event: {exc}")
-
-    # Clear activeSession on cabinet
-    try:
-        db.collection("cabinet").document(CABINET_ID).update({
-            "activeSession": firestore.DELETE_FIELD,
-        })
-    except Exception as exc:
-        log(f"  WARNING: Could not clear activeSession: {exc}")
-
-    # Update cooldown for recipients
-    if role == "recipient":
-        update_last_visit(uid)
+        log(f"  ERROR in close_session: {exc}")
 
     log(f"  SESSION CLOSED: {display_name} (reason: {reason}, delta: {total_delta:+d})")
 
-    # Show goodbye screen briefly then return to idle
-    goodbye_score = active_session.get("score", 0) + sum(session_score_deltas)
+    # Show goodbye screen briefly, then return to idle —
+    # but ONLY if no new session was opened while we were working.
     _set_display(screen="goodbye", name=display_name, score=max(0, goodbye_score))
-    active_session = None
-    session_score_deltas = []
 
     def _back_to_idle():
         time.sleep(3)
-        _set_display(screen="idle", countdown=0)
+        with _session_lock:
+            if active_session is None:   # don't overwrite a new session's screen
+                _set_display(screen="idle", countdown=0)
     threading.Thread(target=_back_to_idle, daemon=True).start()
 
 
