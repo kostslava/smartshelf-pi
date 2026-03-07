@@ -158,16 +158,14 @@ def _render_frame():
         draw.text((70, 19), f"Pts:{score}", font=_font_sm, fill=1)
 
         if role == "recipient" and countdown > 0:
-            # Big countdown
+            # Big countdown (kept for any external countdown use)
             draw.text((4, 31), "Hold item to camera!", font=_font_sm, fill=1)
-            # Large digit(s)
             cstr = str(countdown)
             draw.text((54, 40), cstr, font=_font_lg, fill=1)
-            # Outer box around countdown
             draw.rectangle((48, 37, 80, 63), outline=1)
         elif role == "recipient":
-            draw.text((4, 33), "Camera will auto-snap", font=_font_sm, fill=1)
-            draw.text((4, 46), "Scan again to sign out", font=_font_sm, fill=1)
+            draw.text((4, 31), "Touch sensor to", font=_font_sm, fill=1)
+            draw.text((4, 43), "take item!", font=_font_md, fill=1)
         else:  # donor
             draw.text((4, 33), "Use app to add items", font=_font_sm, fill=1)
             draw.text((4, 46), "Scan again to sign out", font=_font_sm, fill=1)
@@ -402,17 +400,9 @@ def open_session(uid, role, display_name, score):
     _set_display(screen="session", name=display_name, role=role,
                  score=score, countdown=0)
 
-    # For recipients: drive a live countdown on the OLED
-    if role == "recipient":
-        threading.Thread(
-            target=_recipient_countdown_display,
-            args=(uid, RECIPIENT_COUNTDOWN_SECS),
-            daemon=True,
-        ).start()
-
     log(f"  SESSION OPENED: {display_name} ({role})")
     if role == "recipient":
-        log(f"  >> RECEIVING MODE: Vision Node will auto-capture in 5s")
+        log(f"  >> RECEIVING MODE: Touch sensor D3 to capture item")
 
     return True
 
@@ -485,21 +475,6 @@ def close_session(reason="manual"):
         time.sleep(3)
         _set_display(screen="idle", countdown=0)
     threading.Thread(target=_back_to_idle, daemon=True).start()
-
-
-def _recipient_countdown_display(uid, seconds):
-    """Drive the OLED countdown for a recipient session.
-    Runs in a daemon thread; stops if the session ends.
-    """
-    for remaining in range(seconds, 0, -1):
-        # Stop if session closed
-        if not active_session or active_session.get("uid") != uid:
-            break
-        _set_display(countdown=remaining)
-        time.sleep(1)
-    # Countdown over — show session screen without number
-    if active_session and active_session.get("uid") == uid:
-        _set_display(countdown=0)
 
 
 # ==================================================================
