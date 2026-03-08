@@ -100,8 +100,10 @@ db = firestore.client()
 #   sudo apt install pigpio && sudo systemctl enable --now pigpiod
 # gpiozero will then auto-select the pigpio backend for GPIO 18.
 try:
-    from gpiozero import Servo
-    _door_servo = Servo(SERVO_PIN)
+    from gpiozero import AngularServo
+    # min_angle=0°, max_angle=120° maps directly to the physical range
+    _door_servo = AngularServo(SERVO_PIN, initial_angle=0,
+                               min_angle=0, max_angle=120)
     _door_servo.detach()         # don't hold the servo energised at boot
     HAS_SERVO = True
 except Exception as _servo_err:
@@ -306,25 +308,25 @@ def oled_clear():
 # ==================================================================
 
 def door_open():
-    """Move the door servo to the open position, then detach to save power."""
+    """Move the door servo to 120° (open), then detach to save power."""
     if HAS_SERVO and _door_servo is not None:
         try:
-            _door_servo.value = 0.5
+            _door_servo.angle = 120
             time.sleep(0.5)          # give the servo time to reach position
             _door_servo.detach()     # stop PWM — no more current draw
-            log("  DOOR: opened")
+            log("  DOOR: opened (120°)")
         except Exception as exc:
             log(f"  WARNING: Servo open failed: {exc}")
 
 
 def door_close():
-    """Move the door servo to the closed position, then detach to save power."""
+    """Move the door servo to 0° (closed), then detach to save power."""
     if HAS_SERVO and _door_servo is not None:
         try:
-            _door_servo.value = 0
+            _door_servo.angle = 0
             time.sleep(0.5)          # give the servo time to reach position
             _door_servo.detach()     # stop PWM — no more current draw
-            log("  DOOR: closed")
+            log("  DOOR: closed (0°)")
         except Exception as exc:
             log(f"  WARNING: Servo close failed: {exc}")
 
