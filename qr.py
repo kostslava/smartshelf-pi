@@ -80,7 +80,7 @@ RECIPIENT_COOLDOWN_HOURS = 4   # recipients can visit every 4 hours
 BAN_DURATION_DAYS = 7          # 1-week ban for violations (2nd+ offense)
 COOLDOWN = 2                   # QR scan debounce seconds
 RECIPIENT_COUNTDOWN = 10       # OLED countdown seconds before auto-capture
-RESULT_POLL_TIMEOUT = 30       # seconds to wait for Gemini analysis result
+RESULT_POLL_TIMEOUT = 60       # seconds to wait for Gemini analysis result
 SERVO_PIN = 18                 # GPIO pin for door servo (hardware PWM)
 
 # ---------- Firebase ----------
@@ -246,6 +246,35 @@ def _render_frame():
         draw.text((4, 26), name + "!", font=_font_lg, fill=1)
         score = state["score"]
         draw.text((4, 50), f"Score: {score}", font=_font_sm, fill=1)
+
+    elif screen == "analyzing":
+        # Shown while waiting for AI result — animated progress
+        draw.rectangle((0, 0, 127, 15), fill=1)
+        draw.text((4, 1), "SmartShelf", font=_font_md, fill=0)
+        msg = state.get("message", "Analyzing...")
+        draw.text((4, 22), msg, font=_font_sm, fill=1)
+        # Animated progress bar
+        elapsed = int(time.time()) % 20
+        bar_width = min(120, int((elapsed / 20) * 120))
+        draw.rectangle((4, 40, 4 + bar_width, 46), fill=1)
+        draw.rectangle((4, 40, 124, 46), outline=1)
+        # Animated dots
+        dots = "." * ((int(time.time()) % 3) + 1)
+        draw.text((4, 52), f"Please wait{dots}", font=_font_sm, fill=1)
+
+    elif screen == "scan_result":
+        # Shown when AI analysis is done — shows product name or error
+        draw.rectangle((0, 0, 127, 15), fill=1)
+        draw.text((14, 1), "Scan Done", font=_font_md, fill=0)
+        # Checkmark or X symbol
+        name = state.get("name", "")
+        msg = state.get("message", "")
+        if name:
+            draw.text((4, 20), name, font=_font_md, fill=1)
+            draw.text((4, 38), msg, font=_font_sm, fill=1)
+        else:
+            draw.text((4, 24), msg, font=_font_md, fill=1)
+        draw.text((4, 54), "OK", font=_font_sm, fill=1)
 
     return img
 
@@ -606,22 +635,33 @@ def close_session(reason="manual"):
 # ==================================================================
 
 def _do_capture(uid, frame):
-    """Save captured frame locally, write a scanRequest, and return the doc ref."""
+    """Save captured frame locally, write a scanRequest with base64 photo, and return the doc ref."""
+    import base64
     try:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         save_dir = os.path.expanduser("~/captures")
         os.makedirs(save_dir, exist_ok=True)
         img_path = os.path.join(save_dir, f"{uid}_{ts}.jpg")
         cv2.imwrite(img_path, frame)
+
+        # Encode a thumbnail as base64 so the Arduino vision node can use it
+        # directly instead of taking a new photo from its own camera
+        thumb = cv2.resize(frame, (480, 270))
+        _, thumb_buf = cv2.imencode(".jpg", thumb, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        photo_b64 = base64.b64encode(thumb_buf.tobytes()).decode()
+
         _ts, doc_ref = db.collection("scanRequests").add({
             "userId": uid,
             "cabinetId": CABINET_ID,
             "action": "remove",
             "status": "pending",
-            "timestamp": firestore.SERVER_TIMESTAMP,
+            "requestedAt": firestore.SERVER_TIMESTAMP,   # must match Arduino poll query field
+            "triggerType": "recipient_auto",
+            "userRole": "recipient",
             "imagePath": img_path,
+            "photoData": photo_b64,                      # base64 JPEG for AI analysis
         })
-        log(f"  CAPTURED: {img_path}")
+        log(f"  CAPTURED: {img_path} (photoData included, {len(photo_b64)//1024}KB)")
         return doc_ref
     except Exception as exc:
         log(f"  WARNING: Capture failed: {exc}")
@@ -629,7 +669,7 @@ def _do_capture(uid, frame):
 
 
 def _poll_result_and_punish(uid, doc_ref):
-    """Poll the scanRequest doc until Gemini finishes and log the outcome.
+    """Poll the scanRequest doc until Gemini finishes, update OLED, and log the outcome.
 
     Violation is ONLY applied when the AI result explicitly reports that
     there is no food item in the frame at all (confidence == 0 or
@@ -637,14 +677,24 @@ def _poll_result_and_punish(uid, doc_ref):
     the user took something; the record just didn't match.
     """
     deadline = time.time() + RESULT_POLL_TIMEOUT
+    poll_count = 0
     while time.time() < deadline:
         time.sleep(2)
+        poll_count += 1
         try:
             snap = doc_ref.get()
             if not snap.exists:
                 break
             data = snap.to_dict()
             status = data.get("status", "")
+
+            # Update OLED with polling progress
+            if status == "processing":
+                elapsed = int(time.time() - (deadline - RESULT_POLL_TIMEOUT))
+                _set_display(screen="analyzing", message=f"AI working... {elapsed}s")
+            elif status in ("pending", ""):
+                _set_display(screen="analyzing", message="Waiting for AI...")
+
             if status not in ("pending", "processing", ""):
                 result     = data.get("result") or {}
                 product    = (result.get("productName") or "").strip().lower()
@@ -655,13 +705,41 @@ def _poll_result_and_punish(uid, doc_ref):
                 )
                 if truly_empty:
                     log(f"  AI found nothing in frame (conf={confidence:.0%}) — applying violation to {uid}")
+                    _set_display(screen="scan_result", message="No item detected!", name="")
                     apply_ban(uid, reason="empty_frame")
+                elif status == "error":
+                    err_msg = data.get("errorMessage", "Analysis failed")
+                    log(f"  Scan error for {uid}: {err_msg}")
+                    _set_display(screen="scan_result", message=err_msg[:30], name="")
                 else:
+                    display_product = (result.get("productName") or "Item")[:22]
                     log(f"  Scan complete for {uid}: '{product}' (conf={confidence:.0%}) — no violation")
+                    _set_display(screen="scan_result",
+                                 message=f"{confidence*100:.0f}% match",
+                                 name=display_product)
+
+                # Show result for 4 seconds, then return to session or idle
+                time.sleep(4)
+                with _session_lock:
+                    sess = active_session
+                if sess and sess.get("uid") == uid:
+                    _set_display(screen="session", countdown=-1)
+                else:
+                    _set_display(screen="idle", countdown=0)
                 return
         except Exception as exc:
             log(f"  WARNING: Result poll failed: {exc}")
+
+    # Timed out — tell the user
     log(f"  Result poll timed out for {uid} — no action taken")
+    _set_display(screen="scan_result", message="Timed out", name="Try again")
+    time.sleep(3)
+    with _session_lock:
+        sess = active_session
+    if sess and sess.get("uid") == uid:
+        _set_display(screen="session", countdown=-1)
+    else:
+        _set_display(screen="idle", countdown=0)
 
 
 def recipient_capture_loop(uid):
@@ -698,7 +776,7 @@ def recipient_capture_loop(uid):
         time.sleep(0.1)  # ~10 fps is plenty for a countdown
 
     log("  Countdown elapsed — capturing frame")
-    _set_display(countdown=0)  # flip OLED to "Analyzing..."
+    _set_display(screen="analyzing", message="Capturing photo...")
 
     doc_ref = _do_capture(uid, last_frame)
 
@@ -707,13 +785,18 @@ def recipient_capture_loop(uid):
     door_close()
 
     if doc_ref:
-        threading.Thread(
-            target=_poll_result_and_punish,
-            args=(uid, doc_ref),
-            daemon=True,
-        ).start()
-
-    _set_display(screen="session", countdown=0)
+        _set_display(screen="analyzing", message="Sending to AI...")
+        # Poll in this thread (not a separate one) so OLED stays updated
+        _poll_result_and_punish(uid, doc_ref)
+    else:
+        _set_display(screen="scan_result", message="Capture failed", name="")
+        time.sleep(3)
+        with _session_lock:
+            sess = active_session
+        if sess and sess.get("uid") == uid:
+            _set_display(screen="session", countdown=-1)
+        else:
+            _set_display(screen="idle", countdown=0)
 
 
 # ==================================================================
@@ -721,13 +804,20 @@ def recipient_capture_loop(uid):
 # ==================================================================
 
 def heartbeat_loop():
-    """Update isOnline every 30 seconds and refresh capacity on OLED."""
+    """Update lastUpdated every 20 seconds and refresh capacity on OLED.
+
+    The web app determines online status by checking whether lastUpdated
+    is within the last 90 seconds, so a 20-second heartbeat gives us
+    ~4 chances before the web UI would show 'offline'.
+    """
+    consecutive_failures = 0
     while True:
         try:
             db.collection("cabinet").document(CABINET_ID).set({
                 "isOnline": True,
                 "lastUpdated": firestore.SERVER_TIMESTAMP,
             }, merge=True)
+            consecutive_failures = 0   # reset on success
             # Refresh capacity on idle screen
             cab = db.collection("cabinet").document(CABINET_ID).get()
             if cab.exists:
@@ -736,8 +826,11 @@ def heartbeat_loop():
                 total = d.get("totalSlots", 20)
                 _set_display(capacity=f"{cur}/{total}")
         except Exception as exc:
-            log(f"  Heartbeat failed: {exc}")
-        time.sleep(30)
+            consecutive_failures += 1
+            log(f"  Heartbeat failed ({consecutive_failures}x): {exc}")
+            if consecutive_failures >= 3:
+                log("  WARNING: Multiple heartbeat failures — possible connectivity issue")
+        time.sleep(20)
 
 
 # ==================================================================
