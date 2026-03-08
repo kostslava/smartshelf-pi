@@ -81,11 +81,33 @@ BAN_DURATION_DAYS = 7          # 1-week ban for violations (2nd+ offense)
 COOLDOWN = 2                   # QR scan debounce seconds
 RECIPIENT_COUNTDOWN = 10       # OLED countdown seconds before auto-capture
 RESULT_POLL_TIMEOUT = 30       # seconds to wait for Gemini analysis result
+SERVO_PIN = 18                 # GPIO pin for door servo (hardware PWM)
 
 # ---------- Firebase ----------
 cred = credentials.Certificate(SERVICE_ACCOUNT_KEY_PATH)
 firebase_admin.initialize_app(cred)
 db = firestore.client()
+
+# ---------- Servo (door) ----------
+# IMPORTANT — hardware note:
+# The servo signal wire connects to SERVO_PIN (GPIO 18, hardware PWM).
+# The servo's VCC **must** come from an external 5 V supply (or the charger
+# output rail), NOT from the Pi's 5 V / 3.3 V headers.  Drawing servo
+# current through the Pi's power pins causes brown-outs and crashes.
+# Share only the GND between the external supply and the Pi.
+#
+# For smooth, jitter-free PWM install pigpio and start the daemon:
+#   sudo apt install pigpio && sudo systemctl enable --now pigpiod
+# gpiozero will then auto-select the pigpio backend for GPIO 18.
+try:
+    from gpiozero import Servo
+    _door_servo = Servo(SERVO_PIN)
+    _door_servo.detach()         # don't hold the servo energised at boot
+    HAS_SERVO = True
+except Exception as _servo_err:
+    HAS_SERVO = False
+    _door_servo = None
+    print(f"[Servo] Not available: {_servo_err}", flush=True)
 
 # ---------- Camera ----------
 def _init_camera(retries=10, delay=3):
@@ -118,6 +140,7 @@ active_session = None          # dict with uid, role, displayName, etc.
 session_timer = None           # threading.Timer for auto-close
 session_score_deltas = []      # accumulated score changes
 _session_lock = threading.RLock()  # prevents timer thread / main thread races
+_camera_lock = threading.Lock()    # serialises all picam2.capture_array() calls
 
 
 def log(msg=""):
@@ -247,6 +270,34 @@ def oled_clear():
             oled.clear()
         except Exception:
             pass
+
+
+# ==================================================================
+# DOOR SERVO
+# ==================================================================
+
+def door_open():
+    """Move the door servo to the open position, then detach to save power."""
+    if HAS_SERVO and _door_servo is not None:
+        try:
+            _door_servo.value = 0.5
+            time.sleep(0.5)          # give the servo time to reach position
+            _door_servo.detach()     # stop PWM — no more current draw
+            log("  DOOR: opened")
+        except Exception as exc:
+            log(f"  WARNING: Servo open failed: {exc}")
+
+
+def door_close():
+    """Move the door servo to the closed position, then detach to save power."""
+    if HAS_SERVO and _door_servo is not None:
+        try:
+            _door_servo.value = 0
+            time.sleep(0.5)          # give the servo time to reach position
+            _door_servo.detach()     # stop PWM — no more current draw
+            log("  DOOR: closed")
+        except Exception as exc:
+            log(f"  WARNING: Servo close failed: {exc}")
 
 
 # ==================================================================
@@ -446,6 +497,7 @@ def open_session(uid, role, display_name, score):
     _set_display(screen="session", name=display_name, role=role,
                  score=score, countdown=0)
 
+    door_open()
     log(f"  SESSION OPENED: {display_name} ({role})")
     if role == "recipient":
         log(f"  >> RECEIVING MODE: 10s countdown + motion capture")
@@ -534,6 +586,7 @@ def close_session(reason="manual"):
     except Exception as exc:
         log(f"  ERROR in close_session: {exc}")
 
+    door_close()
     log(f"  SESSION CLOSED: {display_name} (reason: {reason}, delta: {total_delta:+d})")
 
     # Show goodbye screen briefly, then return to idle —
@@ -632,7 +685,8 @@ def recipient_capture_loop(uid):
         if sess is None or sess.get("uid") != uid:
             return
 
-        last_frame = picam2.capture_array()
+        with _camera_lock:
+            last_frame = picam2.capture_array()
 
         now = time.time()
         remaining = max(0, int(deadline - now))
@@ -647,6 +701,11 @@ def recipient_capture_loop(uid):
     _set_display(countdown=0)  # flip OLED to "Analyzing..."
 
     doc_ref = _do_capture(uid, last_frame)
+
+    # Close the door as soon as the item is captured and AI analysis begins.
+    # The session (and its own door_close) will handle any remaining cleanup.
+    door_close()
+
     if doc_ref:
         threading.Thread(
             target=_poll_result_and_punish,
@@ -713,7 +772,8 @@ def main():
 
     try:
         while True:
-            frame = picam2.capture_array()
+            with _camera_lock:
+                frame = picam2.capture_array()
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             data, bbox, _ = detector.detectAndDecode(gray)
 
@@ -795,8 +855,8 @@ def main():
                     # Open session
                     open_session(uid, role, display_name, score)
 
-            if cv2.waitKey(1) == ord("q"):
-                break
+            # ~30 fps cap — keeps CPU usage sane and prevents thermal crashes
+            time.sleep(0.033)
 
     except KeyboardInterrupt:
         log("Shutting down...")
